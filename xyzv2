@@ -1,0 +1,435 @@
+"""
+grating_edges.py
+=================
+
+Phase 1 of the industrial-grating measurement pipeline:
+
+    input image  ->  remove background (rembg)  ->  detect edges (DexiNed)
+                 ->  keep only edges that lie on the object
+                 ->  draw the edges in YELLOW on the segmented object
+
+Everything (including the DexiNed network definition) lives in this one file.
+
+----------------------------------------------------------------------------
+SETUP
+----------------------------------------------------------------------------
+    pip install rembg onnxruntime torch torchvision opencv-python numpy pillow
+
+DexiNed pretrained weights (one small file, ~10 MB) are required:
+    File name : 10_model.pth
+    Source    : official DexiNed repo  ->  https://github.com/xavysp/DexiNed
+                (Checkpoints link in the README, Google Drive)
+    Put 10_model.pth next to this script, or pass --weights /path/to/10_model.pth
+
+----------------------------------------------------------------------------
+USAGE
+----------------------------------------------------------------------------
+    python grating_edges.py --input grating.jpg --output grating_edges.png
+
+    # tune how aggressive the edge picking is (0..1, lower = more edges)
+    python grating_edges.py --input grating.jpg --threshold 0.30 --thickness 1
+"""
+
+import os
+import argparse
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ===========================================================================
+#  DexiNed network  (verbatim architecture from xavysp/DexiNed, model.py)
+#  Embedded here so the whole pipeline stays in a single file.
+# ===========================================================================
+def weight_init(m):
+    if isinstance(m, nn.Conv2d):
+        torch.nn.init.xavier_normal_(m.weight, gain=1.0)
+        if m.weight.data.shape[1] == torch.Size([1]):
+            torch.nn.init.normal_(m.weight, mean=0.0)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+    if isinstance(m, nn.ConvTranspose2d):
+        torch.nn.init.xavier_normal_(m.weight, gain=1.0)
+        if m.weight.data.shape[1] == torch.Size([1]):
+            torch.nn.init.normal_(m.weight, std=0.1)
+        if m.bias is not None:
+            torch.nn.init.zeros_(m.bias)
+
+
+class CoFusion(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, 32, 3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 32, 3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(32, out_ch, 3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+        self.norm_layer1 = nn.GroupNorm(4, 32)
+        self.norm_layer2 = nn.GroupNorm(4, 32)
+
+    def forward(self, x):
+        attn = self.relu(self.norm_layer1(self.conv1(x)))
+        attn = self.relu(self.norm_layer2(self.conv2(attn)))
+        attn = F.softmax(self.conv3(attn), dim=1)
+        return ((x * attn).sum(1)).unsqueeze(1)
+
+
+class _DenseLayer(nn.Sequential):
+    def __init__(self, input_features, out_features):
+        super().__init__()
+        self.add_module('conv1', nn.Conv2d(input_features, out_features,
+                        kernel_size=3, stride=1, padding=2, bias=True))
+        self.add_module('norm1', nn.BatchNorm2d(out_features))
+        self.add_module('relu1', nn.ReLU(inplace=True))
+        self.add_module('conv2', nn.Conv2d(out_features, out_features,
+                        kernel_size=3, stride=1, bias=True))
+        self.add_module('norm2', nn.BatchNorm2d(out_features))
+
+    def forward(self, x):
+        x1, x2 = x
+        new_features = super().forward(F.relu(x1))
+        return 0.5 * (new_features + x2), x2
+
+
+class _DenseBlock(nn.Sequential):
+    def __init__(self, num_layers, input_features, out_features):
+        super().__init__()
+        for i in range(num_layers):
+            layer = _DenseLayer(input_features, out_features)
+            self.add_module('denselayer%d' % (i + 1), layer)
+            input_features = out_features
+
+
+class UpConvBlock(nn.Module):
+    def __init__(self, in_features, up_scale):
+        super().__init__()
+        self.up_factor = 2
+        self.constant_features = 16
+        layers = self.make_deconv_layers(in_features, up_scale)
+        assert layers is not None, layers
+        self.features = nn.Sequential(*layers)
+
+    def make_deconv_layers(self, in_features, up_scale):
+        layers = []
+        all_pads = [0, 0, 1, 3, 7]
+        for i in range(up_scale):
+            kernel_size = 2 ** up_scale
+            pad = all_pads[up_scale]
+            out_features = self.compute_out_features(i, up_scale)
+            layers.append(nn.Conv2d(in_features, out_features, 1))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.ConvTranspose2d(
+                out_features, out_features, kernel_size, stride=2, padding=pad))
+            in_features = out_features
+        return layers
+
+    def compute_out_features(self, idx, up_scale):
+        return 1 if idx == up_scale - 1 else self.constant_features
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class SingleConvBlock(nn.Module):
+    def __init__(self, in_features, out_features, stride, use_bs=True):
+        super().__init__()
+        self.use_bn = use_bs
+        self.conv = nn.Conv2d(in_features, out_features, 1, stride=stride, bias=True)
+        self.bn = nn.BatchNorm2d(out_features)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.use_bn:
+            x = self.bn(x)
+        return x
+
+
+class DoubleConvBlock(nn.Module):
+    def __init__(self, in_features, mid_features, out_features=None,
+                 stride=1, use_act=True):
+        super().__init__()
+        self.use_act = use_act
+        if out_features is None:
+            out_features = mid_features
+        self.conv1 = nn.Conv2d(in_features, mid_features, 3, padding=1, stride=stride)
+        self.bn1 = nn.BatchNorm2d(mid_features)
+        self.conv2 = nn.Conv2d(mid_features, out_features, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_features)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        if self.use_act:
+            x = self.relu(x)
+        return x
+
+
+class DexiNed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block_1 = DoubleConvBlock(3, 32, 64, stride=2)
+        self.block_2 = DoubleConvBlock(64, 128, use_act=False)
+        self.dblock_3 = _DenseBlock(2, 128, 256)
+        self.dblock_4 = _DenseBlock(3, 256, 512)
+        self.dblock_5 = _DenseBlock(3, 512, 512)
+        self.dblock_6 = _DenseBlock(3, 512, 256)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.side_1 = SingleConvBlock(64, 128, 2)
+        self.side_2 = SingleConvBlock(128, 256, 2)
+        self.side_3 = SingleConvBlock(256, 512, 2)
+        self.side_4 = SingleConvBlock(512, 512, 1)
+        self.side_5 = SingleConvBlock(512, 256, 1)
+
+        self.pre_dense_2 = SingleConvBlock(128, 256, 2)
+        self.pre_dense_3 = SingleConvBlock(128, 256, 1)
+        self.pre_dense_4 = SingleConvBlock(256, 512, 1)
+        self.pre_dense_5 = SingleConvBlock(512, 512, 1)
+        self.pre_dense_6 = SingleConvBlock(512, 256, 1)
+
+        self.up_block_1 = UpConvBlock(64, 1)
+        self.up_block_2 = UpConvBlock(128, 1)
+        self.up_block_3 = UpConvBlock(256, 2)
+        self.up_block_4 = UpConvBlock(512, 3)
+        self.up_block_5 = UpConvBlock(512, 4)
+        self.up_block_6 = UpConvBlock(256, 4)
+        self.block_cat = SingleConvBlock(6, 1, stride=1, use_bs=False)
+
+        self.apply(weight_init)
+
+    def slice(self, tensor, slice_shape):
+        t_shape = tensor.shape
+        height, width = slice_shape
+        if t_shape[-1] != slice_shape[-1]:
+            return F.interpolate(tensor, size=(height, width),
+                                 mode='bicubic', align_corners=False)
+        return tensor
+
+    def forward(self, x):
+        assert x.ndim == 4, x.shape
+
+        block_1 = self.block_1(x)
+        block_1_side = self.side_1(block_1)
+
+        block_2 = self.block_2(block_1)
+        block_2_down = self.maxpool(block_2)
+        block_2_add = block_2_down + block_1_side
+        block_2_side = self.side_2(block_2_add)
+
+        block_3_pre_dense = self.pre_dense_3(block_2_down)
+        block_3, _ = self.dblock_3([block_2_add, block_3_pre_dense])
+        block_3_down = self.maxpool(block_3)
+        block_3_add = block_3_down + block_2_side
+        block_3_side = self.side_3(block_3_add)
+
+        block_4_pre_dense_256 = self.pre_dense_2(block_2_down)
+        block_4_pre_dense = self.pre_dense_4(block_4_pre_dense_256 + block_3_down)
+        block_4, _ = self.dblock_4([block_3_add, block_4_pre_dense])
+        block_4_down = self.maxpool(block_4)
+        block_4_add = block_4_down + block_3_side
+        block_4_side = self.side_4(block_4_add)
+
+        block_5_pre_dense = self.pre_dense_5(block_4_down)
+        block_5, _ = self.dblock_5([block_4_add, block_5_pre_dense])
+        block_5_add = block_5 + block_4_side
+
+        block_6_pre_dense = self.pre_dense_6(block_5)
+        block_6, _ = self.dblock_6([block_5_add, block_6_pre_dense])
+
+        out_1 = self.up_block_1(block_1)
+        out_2 = self.up_block_2(block_2)
+        out_3 = self.up_block_3(block_3)
+        out_4 = self.up_block_4(block_4)
+        out_5 = self.up_block_5(block_5)
+        out_6 = self.up_block_6(block_6)
+        results = [out_1, out_2, out_3, out_4, out_5, out_6]
+
+        block_cat = torch.cat(results, dim=1)        # B x 6 x H x W
+        block_cat = self.block_cat(block_cat)        # B x 1 x H x W
+        results.append(block_cat)
+        return results
+
+
+# ===========================================================================
+#  Pipeline helpers
+# ===========================================================================
+# DexiNed was trained on BGR images with this mean subtracted (BGR order).
+DEXINED_MEAN = np.array([103.939, 116.779, 123.68], dtype=np.float32)
+
+
+def _solid_footprint(mask):
+    """Turn a holey grating mask into one solid region (its outer footprint).
+
+    rembg cuts out the open cells of the grating, so the raw mask is full of
+    holes -- which would discard every interior bar edge. We fill the largest
+    external contour(s) so the whole grating area becomes the region of
+    interest, then edges on the bars inside are all kept.
+    """
+    # drop tiny speckles first
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+    solid = np.zeros_like(mask)
+    # keep contours that are a meaningful fraction of the biggest one
+    biggest = max(cv2.contourArea(c) for c in contours)
+    for c in contours:
+        if cv2.contourArea(c) >= 0.05 * biggest:
+            cv2.drawContours(solid, [c], -1, 255, thickness=cv2.FILLED)
+    return solid
+
+
+def remove_background(bgr, model_name="u2net"):
+    """rembg -> (segmented_bgr_on_white, raw_alpha_mask, solid_footprint_mask).
+
+    - segmented image: object composited on white (for display).
+    - raw mask: rembg alpha (bars only, holes excluded).
+    - footprint mask: solid grating area, used to restrict edges.
+    """
+    from rembg import remove, new_session
+
+    session = new_session(model_name)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    rgba = np.asarray(remove(rgb, session=session))   # H x W x 4 RGBA
+
+    alpha = rgba[:, :, 3].astype(np.float32) / 255.0
+    raw_mask = (rgba[:, :, 3] > 10).astype(np.uint8) * 255
+    footprint = _solid_footprint(raw_mask)
+
+    fg = rgba[:, :, :3].astype(np.float32)
+    white = np.ones_like(fg) * 255.0
+    comp = fg * alpha[..., None] + white * (1.0 - alpha[..., None])
+    seg_bgr = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_RGB2BGR)
+    return seg_bgr, raw_mask, footprint
+
+
+def round_to_multiple(v, m=16):
+    return int(np.ceil(v / m) * m)
+
+
+def detect_edges_dexined(bgr, model, device):
+    """Run DexiNed and return a float edge map in [0,1] at the original size."""
+    h, w = bgr.shape[:2]
+    # DexiNed needs spatial dims divisible by 16; resize, infer, resize back.
+    nh, nw = round_to_multiple(h), round_to_multiple(w)
+    resized = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    img = resized.astype(np.float32) - DEXINED_MEAN          # BGR mean-sub
+    tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        preds = model(tensor)
+
+    # Use the FUSED output (preds[-1]) only. Averaging all 7 side maps pulls in
+    # the coarse low-res ones (out_5/out_6) which are blurry and bloat the
+    # edges into thick blobs. The fused map is the sharpest single output.
+    edge = torch.sigmoid(preds[-1])[0, 0].cpu().numpy()
+
+    edge = cv2.resize(edge, (w, h), interpolation=cv2.INTER_LINEAR)
+    # Normalize to the full [0,1] range for stable thresholding.
+    edge = (edge - edge.min()) / (edge.max() - edge.min() + 1e-8)
+    return edge
+
+
+def thin_edges(binary):
+    """Reduce thick edge blobs to 1-px lines (Canny-like).
+
+    Prefers Zhang-Suen thinning from opencv-contrib (cv2.ximgproc); falls back
+    to a morphological skeleton so no extra dependency is strictly required.
+    """
+    if hasattr(cv2, "ximgproc"):
+        return cv2.ximgproc.thinning(binary)
+
+    # Morphological skeleton fallback (works with plain opencv-python).
+    img = binary.copy()
+    skel = np.zeros(img.shape, np.uint8)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    while cv2.countNonZero(img) > 0:
+        opened = cv2.morphologyEx(img, cv2.MORPH_OPEN, element)
+        skel = cv2.bitwise_or(skel, cv2.subtract(img, opened))
+        img = cv2.erode(img, element)
+    return skel
+
+
+def overlay_yellow_edges(seg_bgr, edge_map, obj_mask, threshold, thickness, do_thin):
+    """Binarize the edge map inside the object, thin it, and paint it yellow."""
+    binary = (edge_map >= threshold).astype(np.uint8) * 255
+
+    # Keep only edges that fall on the grating footprint.
+    binary = cv2.bitwise_and(binary, binary, mask=obj_mask)
+
+    if do_thin:
+        binary = thin_edges(binary)
+
+    if thickness > 1:
+        k = np.ones((thickness, thickness), np.uint8)
+        binary = cv2.dilate(binary, k, iterations=1)
+
+    out = seg_bgr.copy()
+    out[binary > 0] = (0, 255, 255)          # BGR yellow
+    return out, binary
+
+
+# ===========================================================================
+#  Main
+# ===========================================================================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Segment object (rembg) + precise edges (DexiNed) in yellow.")
+    ap.add_argument("--input", required=True, help="path to input image")
+    ap.add_argument("--output", default="output_edges.png", help="path to output image")
+    ap.add_argument("--weights", default="10_model.pth", help="DexiNed checkpoint")
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="edge map threshold 0..1 (lower => more edges)")
+    ap.add_argument("--thickness", type=int, default=1, help="edge line thickness (px)")
+    ap.add_argument("--no-thin", dest="thin", action="store_false",
+                    help="skip thinning (keep thick DexiNed edges)")
+    ap.add_argument("--rembg-model", default="u2net",
+                    help="rembg model: u2net | isnet-general-use | u2netp ...")
+    ap.add_argument("--device", default=None, help="cpu / cuda (auto if omitted)")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.input):
+        raise FileNotFoundError(f"Input image not found: {args.input}")
+    if not os.path.isfile(args.weights):
+        raise FileNotFoundError(
+            f"DexiNed weights not found: {args.weights}\n"
+            "Download 10_model.pth from https://github.com/xavysp/DexiNed "
+            "(Checkpoints link) and place it here or pass --weights.")
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"[i] device: {device}")
+
+    bgr = cv2.imread(args.input, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError(f"Could not read image: {args.input}")
+
+    print(f"[i] removing background (rembg: {args.rembg_model}) ...")
+    seg_bgr, _raw_mask, footprint = remove_background(bgr, args.rembg_model)
+
+    print("[i] loading DexiNed ...")
+    model = DexiNed().to(device)
+    state = torch.load(args.weights, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    print("[i] detecting edges (DexiNed) ...")
+    # Detect on the ORIGINAL pixels (real metal texture), then restrict to the
+    # grating footprint. Running on the white composite created fake halo edges.
+    edge_map = detect_edges_dexined(bgr, model, device)
+
+    print("[i] overlaying yellow edges ...")
+    result, _ = overlay_yellow_edges(
+        seg_bgr, edge_map, footprint, args.threshold, args.thickness, args.thin)
+
+    cv2.imwrite(args.output, result)
+    print(f"[done] wrote: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
